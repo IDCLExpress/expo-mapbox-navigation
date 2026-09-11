@@ -246,6 +246,58 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     private val voiceInstructionsPlayerCallback =
             MapboxNavigationConsumer<SpeechAnnouncement> { value -> speechApi.clean(value) }
 
+
+    /**
+     * [SYNCFORGE-244] Serialises synthesis. speechApi.generate() is NOT a queue.
+     *
+     * Two concurrent generate() calls clobber each other before either reaches the
+     * player, cutting the first utterance off. Measured 2026-09-11 02:42: focus taken
+     * and abandoned after 71ms, then a second utterance played for 3.5s.
+     *
+     * BOTH paths pass through here - SafeRoute's announcements AND the SDK's own turn
+     * instructions. Gating only one would leave the collision exactly as it was.
+     *
+     * Main-thread only: prop setters, the observer and speechCallback all run there,
+     * so no locking. If that stops being true this becomes a race.
+     */
+    private var speechInFlight = false
+    private val pendingSpeech = ArrayDeque<com.mapbox.api.directions.v5.models.VoiceInstructions>()
+
+    private fun enqueueSpeech(instruction: com.mapbox.api.directions.v5.models.VoiceInstructions) {
+        if (speechInFlight) {
+            if (pendingSpeech.size >= 10) {
+                android.util.Log.w("SyncForge", "[SF-244] speech queue full; dropping an announcement")
+                return
+            }
+            pendingSpeech.addLast(instruction)
+            android.util.Log.i("SyncForge", "[SF-244] queued (" + pendingSpeech.size + " waiting)")
+            return
+        }
+        speechInFlight = true
+        speechApi.generate(instruction, speechCallback)
+    }
+
+    private fun speakText(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        enqueueSpeech(
+                com.mapbox.api.directions.v5.models.VoiceInstructions.builder()
+                        .announcement(trimmed)
+                        .distanceAlongGeometry(0.0)
+                        .build()
+        )
+    }
+
+    /**
+     * Releases the next queued item. MUST run on every completion path, success or
+     * failure - a stalled queue is permanent silence, worse than the bug it fixes.
+     */
+    private fun onSpeechFinished() {
+        speechInFlight = false
+        val next = pendingSpeech.removeFirstOrNull() ?: return
+        enqueueSpeech(next)
+    }
+
     private val speechCallback =
             MapboxNavigationConsumer<Expected<SpeechError, SpeechValue>> { expected ->
                 expected.fold(
@@ -262,9 +314,16 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                             )
                         }
                 )
+                // [SF-244] Synthesis is complete either way - the error branch plays a
+                // fallback, so both are completions. Released here rather than inside a
+                // branch: a synthesis failure inside a branch would stall the queue
+                // permanently and the app would go silent.
+                onSpeechFinished()
             }
     private val voiceInstructionsObserver = VoiceInstructionsObserver { voiceInstructions ->
-        speechApi.generate(voiceInstructions, speechCallback)
+        // [SF-244] Through the queue, not straight to generate(). This is the path
+        // SafeRoute's announcements were colliding with.
+        enqueueSpeech(voiceInstructions)
     }
 
     private val routesRequestCallback =
