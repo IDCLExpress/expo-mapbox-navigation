@@ -995,14 +995,68 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
         style.addLayerAbove(rasterLayer, aboveLayerId)
     }
 
+    /**
+     * [SYNCFORGE-239] The locale the speech components were built for.
+     *
+     * MapboxVoiceInstructionsPlayer and MapboxSpeechApi are constructed with a locale
+     * and nothing else, so they only need rebuilding when the locale actually changes -
+     * which happens at mount, not on every prop update.
+     */
+    private var lastAppliedLocale: java.util.Locale? = null
+
+    /**
+     * [SYNCFORGE-239] Signature of the inputs the last route request was built from.
+     *
+     * Derived from requestRoutes() itself rather than guessed: if a field it reads is
+     * missing here, a genuine route change would be skipped and the driver guided along
+     * a stale route - a worse failure than the one being fixed. Keep this in step with
+     * requestRoutes() and requestMapMatchingRoutes().
+     */
+    private var lastRouteSignature: String? = null
+
+    private fun routeSignature(): String =
+            listOf(
+                            currentCoordinates?.joinToString(";") { "${it.longitude()},${it.latitude()}" },
+                            currentWaypointIndices?.joinToString(","),
+                            currentRouteProfile,
+                            currentRouteExcludeList?.joinToString(","),
+                            vehicleMaxHeight?.toString(),
+                            vehicleMaxWidth?.toString(),
+                            currentDisableAlternativeRoutes?.toString(),
+                            currentLocale.toLanguageTag(),
+                            isUsingRouteMatchingApi.toString()
+                    )
+                    .joinToString("|") { it ?: "-" }
+
     @com.mapbox.navigation.base.ExperimentalPreviewMapboxNavigationAPI
     private fun update() {
-        voiceInstructionsPlayer =
-                MapboxVoiceInstructionsPlayer(context, currentLocale.toLanguageTag())
-        voiceInstructionsPlayer.volume(
-                SpeechVolume(if (isMuted) 0.0f else 1.0f)
-        ) // Initial volume based on current isMuted state
-        speechApi = MapboxSpeechApi(context, currentLocale.toLanguageTag())
+        // [SYNCFORGE-239] NEVER replace the voice player. Retune it in place.
+        //
+        // This block previously rebuilt voiceInstructionsPlayer and speechApi on every
+        // update(), and twelve prop setters call update(). Any prop changing during
+        // navigation destroyed the component that was speaking. Measured on device
+        // 2026-09-10 22:47 (build 1417099): audio focus taken at .825 and abandoned at
+        // .970 - 145ms, far too short to say a word. That is the voice cutting out.
+        //
+        // MapboxVoiceInstructionsPlayer.updateLanguage(String) exists - verified with
+        // javap against voice-ndk27-3.11.0.aar - so even a locale change does not
+        // require a new instance. One player for the life of the view means there is no
+        // moment when it does not exist, and no audio focus to strand.
+        //
+        // speechApi is replaced on a locale change only. It holds no audio focus and is
+        // a synthesis client, so replacing it cannot interrupt playback that is already
+        // in the player's queue.
+        if (lastAppliedLocale != currentLocale) {
+            voiceInstructionsPlayer.updateLanguage(currentLocale.toLanguageTag())
+            speechApi = MapboxSpeechApi(context, currentLocale.toLanguageTag())
+            lastAppliedLocale = currentLocale
+            android.util.Log.i(
+                    "SyncForge",
+                    "[SF-239] speech language set to " + currentLocale.toLanguageTag()
+            )
+        }
+        // Volume is cheap and reflects the mute prop, so it is applied every time.
+        voiceInstructionsPlayer.volume(SpeechVolume(if (isMuted) 0.0f else 1.0f))
 
         if (currentMapStyle != null) {
             mapboxMap.loadStyle(currentMapStyle!!) { style: Style ->
@@ -1029,15 +1083,29 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                         .build()
         tripProgressApi = MapboxTripProgressApi(tripProgressFormatter)
 
-        if (currentMapMatchingRequestId != null) {
-            mapboxNavigation?.cancelMapMatchingRequest(currentMapMatchingRequestId!!)
-        }
+        // [SYNCFORGE-239] Re-request routes ONLY when the route inputs actually changed.
+        //
+        // update() ended by re-planning the trip unconditionally, so a prop unrelated to
+        // routing - raster URL, zoom, mute - finished the running navigation session.
+        // Measured 2026-09-10 22:47:
+        //   22:47:27.714  routes update - finished
+        //   22:47:27.731  routes update - starting          <- second time, 17ms later
+        //   22:47:27.735  setRoutes finish the previous navigation session
+        // That teardown is what ended navigation seconds after it started and unmounted
+        // the weather band with it.
+        val signature = routeSignature()
+        if (currentCoordinates != null && signature != lastRouteSignature) {
+            // Cancel in-flight requests only when actually replacing them. Cancelling
+            // unconditionally aborted a request that was still the correct one.
+            if (currentMapMatchingRequestId != null) {
+                mapboxNavigation?.cancelMapMatchingRequest(currentMapMatchingRequestId!!)
+            }
+            if (currentRoutesRequestId != null) {
+                mapboxNavigation?.cancelRouteRequest(currentRoutesRequestId!!)
+            }
 
-        if (currentRoutesRequestId != null) {
-            mapboxNavigation?.cancelRouteRequest(currentRoutesRequestId!!)
-        }
-
-        if (currentCoordinates != null) {
+            lastRouteSignature = signature
+            android.util.Log.i("SyncForge", "[SF-239] route inputs changed; requesting routes")
             if (isUsingRouteMatchingApi) {
                 requestMapMatchingRoutes()
             } else {
