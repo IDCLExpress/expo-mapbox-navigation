@@ -260,12 +260,33 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
      * Main-thread only: prop setters, the observer and speechCallback all run there,
      * so no locking. If that stops being true this becomes a race.
      */
+    /**
+     * Upper bound on queued announcements.
+     *
+     * A driver can meaningfully act on a handful of utterances; anything beyond that is
+     * a producer misbehaving, and letting the queue grow would make the app talk over
+     * itself minutes after the event that triggered it. Dropping is the safer failure.
+     */
+    private val MAX_PENDING_SPEECH = 10
+
     private var speechInFlight = false
     private val pendingSpeech = ArrayDeque<com.mapbox.api.directions.v5.models.VoiceInstructions>()
 
     private fun enqueueSpeech(instruction: com.mapbox.api.directions.v5.models.VoiceInstructions) {
+        // [SF-244 P2] The no-locking design rests on this being main-thread only. A
+        // comment saying so is not enforcement: if a future SDK change or refactor
+        // calls this from a background thread, the queue corrupts silently and the
+        // symptom would be intermittent lost speech - exactly the class of bug this
+        // ticket exists to remove. Log loudly rather than crash: a mis-threaded
+        // announcement is not worth ending a drive over.
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            android.util.Log.e(
+                    "SyncForge",
+                    "[SF-244] enqueueSpeech called off the main thread - the queue is not thread-safe"
+            )
+        }
         if (speechInFlight) {
-            if (pendingSpeech.size >= 10) {
+            if (pendingSpeech.size >= MAX_PENDING_SPEECH) {
                 android.util.Log.w("SyncForge", "[SF-244] speech queue full; dropping an announcement")
                 return
             }
