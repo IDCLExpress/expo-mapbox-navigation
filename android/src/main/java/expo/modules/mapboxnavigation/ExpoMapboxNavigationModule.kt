@@ -43,7 +43,10 @@ class ExpoMapboxNavigationModule : Module() {
     // the app from starting.
     OnCreate {
       try {
-        val ctx = appContext.reactContext
+        // Application context, not the React context: this instance lives for the whole
+        // process, and holding a context that can be torn down underneath it leaks and
+        // can misbehave on some TTS implementations.
+        val ctx = appContext.reactContext?.applicationContext
         if (ctx != null) {
           ttsWarmup = android.speech.tts.TextToSpeech(ctx) { status ->
             android.util.Log.i(
