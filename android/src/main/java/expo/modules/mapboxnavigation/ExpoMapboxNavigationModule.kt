@@ -11,12 +11,63 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class ExpoMapboxNavigationModule : Module() {
+  /**
+   * [SYNCFORGE-242] Held only to keep the warmed TTS connection alive.
+   * Never used to speak. Shut down in OnDestroy.
+   */
+  private var ttsWarmup: android.speech.tts.TextToSpeech? = null
+
   private val activity
     get() = requireNotNull(appContext.activityProvider?.currentActivity)
 
   @com.mapbox.navigation.base.ExperimentalPreviewMapboxNavigationAPI
   override fun definition() = ModuleDefinition {
     Name("ExpoMapboxNavigation")
+
+    // [SYNCFORGE-242] Warm Android's text-to-speech engine at app launch.
+    //
+    // The engine connection is established asynchronously and took 1.079s on the test
+    // device. The navigation view is built the instant the driver presses Navigate, so
+    // if the app was opened moments earlier the first turn instruction is spoken into
+    // an engine that is not ready and dies mid-phrase. Measured 2026-09-11 01:30:
+    //   TextToSpeech: isSpeaking failed: TTS engine connection not fully set up
+    //   ... requestAudioFocus -> abandonAudioFocus 880ms later
+    // A warm session 90 seconds earlier held focus for 7.8 seconds.
+    //
+    // MODULE scope, not View scope: OnCreate here runs when the module loads at app
+    // launch - minutes before Navigate. Inside View(...) it would fire when the view is
+    // built, which is exactly the moment that is already too late.
+    //
+    // Nothing is ever spoken through this instance; it exists to open the connection.
+    // Failures are swallowed deliberately - a warm-up that cannot run must never stop
+    // the app from starting.
+    OnCreate {
+      try {
+        val ctx = appContext.reactContext
+        if (ctx != null) {
+          ttsWarmup = android.speech.tts.TextToSpeech(ctx) { status ->
+            android.util.Log.i(
+                    "SyncForge",
+                    "[SF-242] TTS warm-up finished, status=" + status +
+                            (if (status == android.speech.tts.TextToSpeech.SUCCESS) " (ready)" else " (unavailable)")
+            )
+          }
+        }
+      } catch (e: Exception) {
+        android.util.Log.w("SyncForge", "[SF-242] TTS warm-up could not start", e)
+      }
+    }
+
+    // A TextToSpeech holds a service connection for the life of the process if it is
+    // never shut down.
+    OnDestroy {
+      try {
+        ttsWarmup?.shutdown()
+        ttsWarmup = null
+      } catch (e: Exception) {
+        android.util.Log.w("SyncForge", "[SF-242] TTS warm-up shutdown failed", e)
+      }
+    }
 
     OnActivityEntersForeground {
       (activity as LifecycleOwner).lifecycleScope.launch(Dispatchers.Main) {
