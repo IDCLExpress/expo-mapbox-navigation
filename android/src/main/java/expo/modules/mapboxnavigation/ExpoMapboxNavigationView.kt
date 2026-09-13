@@ -94,6 +94,7 @@ import expo.modules.kotlin.AppContext
 import expo.modules.kotlin.viewevent.EventDispatcher
 import expo.modules.kotlin.views.ExpoView
 import java.util.Locale
+import com.mapbox.navigation.core.trip.session.TripSessionState
 
 val PIXEL_DENSITY = Resources.getSystem().displayMetrics.density
 
@@ -931,7 +932,39 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
 
     private fun onRoutesReady(routes: List<NavigationRoute>) {
         mapboxNavigation?.setNavigationRoutes(routes)
-        mapboxNavigation?.startTripSession(withForegroundService = false)
+
+        // [SYNCFORGE-251] Start the trip session ONLY when one is not already running.
+        //
+        // This ran unconditionally, so every route response restarted a session that
+        // was already live. Each restart re-emits navState, rebuilds the voice player
+        // and abandons audio focus - measured on device 2026-09-13: two Navigate
+        // presses produced five navState active=true emissions, and a spoken
+        // confirmation needing ~3s was cut at 632ms. When the churn happened to end on
+        // abandon rather than request, the utterance was queued to a player holding no
+        // focus and the driver heard nothing at all. Cut-off and silence were the same
+        // bug landing on different sides of the same restart.
+        //
+        // setNavigationRoutes above is the SDK's update mechanism and applies a new
+        // route to a running session on its own. A route change does NOT need a
+        // session restart.
+        //
+        // Same failure class as SYNCFORGE-239 one level up: 239 stopped update() from
+        // re-planning unconditionally and recorded the teardown in its own comment
+        // ("setRoutes finish the previous navigation session"), but that teardown was
+        // still reachable through this path.
+        val sessionState = mapboxNavigation?.getTripSessionState()
+        if (sessionState != TripSessionState.STARTED) {
+            android.util.Log.i(
+                "SyncForge",
+                "[SYNCFORGE-251] starting trip session (was $sessionState)"
+            )
+            mapboxNavigation?.startTripSession(withForegroundService = false)
+        } else {
+            android.util.Log.i(
+                "SyncForge",
+                "[SYNCFORGE-251] session already STARTED; routes updated without restart"
+            )
+        }
         navigationCamera.requestNavigationCameraToFollowing(
                 stateTransitionOptions =
                         NavigationCameraTransitionOptions.Builder()
