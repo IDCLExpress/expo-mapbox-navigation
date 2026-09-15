@@ -44,6 +44,7 @@ import com.mapbox.navigation.base.route.RouterOrigin
 import com.mapbox.navigation.base.trip.model.RouteLegProgress
 import com.mapbox.navigation.base.trip.model.RouteProgress
 import com.mapbox.navigation.core.arrival.ArrivalObserver
+import com.mapbox.navigation.core.directions.session.RoutesExtra
 import com.mapbox.navigation.core.directions.session.RoutesObserver
 import com.mapbox.navigation.core.directions.session.RoutesUpdatedResult
 import com.mapbox.navigation.core.formatter.MapboxDistanceFormatter
@@ -293,6 +294,21 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
      */
     private var speechEpoch = 0
     private var inFlightEpoch = -1
+
+    /**
+     * [SAFEROUTE-288] Id of the primary route the speech queue currently belongs to.
+     *
+     * null until the first route arrives. That null is load-bearing, not an
+     * initialiser: the first route of a view's life replaces nothing, so there is no
+     * old route's speech to drop, and flushing there is what discarded the departure
+     * announcement. Measured on device 2026-09-15 04:14:13.623/.631 - the
+     * announcement was spoken 8 ms before the routes emission that flushed it.
+     *
+     * Updated on every emission that carries a primary route, including ones that do
+     * not flush, so a later genuine change is compared against what is actually
+     * playing rather than against the last route we happened to flush for.
+     */
+    private var lastPrimaryRouteId: String? = null
     private val pendingSpeech = ArrayDeque<com.mapbox.api.directions.v5.models.VoiceInstructions>()
 
     /**
@@ -502,7 +518,65 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                     // true, because a cancelled generate() never reaches speechCallback.
                     // Every later announcement then queued behind a job that could not
                     // complete and the app went silent for the rest of the session.
-                    flushSpeechForRouteChange("route change")
+                    // [SAFEROUTE-288] The flush is gated. 282 called it on every emission.
+                    //
+                    // onRoutesChanged does NOT fire once per route change - it fires on
+                    // every routes emission. Measured, versionCode 1423130, 2026-09-15:
+                    // 13 flushes for 4 launches (SF-197 = 4), three per launch spread
+                    // over up to six seconds, with the first one landing 8 ms after the
+                    // departure announcement began. 282 removed the stall that used to
+                    // let some announcements through and added an epoch guard that
+                    // discards the synthesis outright, so the announcement went from
+                    // intermittently cut to reliably lost.
+                    //
+                    // Two independent conditions, deliberately ANDed so neither carries
+                    // the fix alone:
+                    //
+                    //   reason  - read from RoutesExtra in navigation-ndk27-3.11.0.aar
+                    //             (javap, not memory): NEW, REROUTE, ALTERNATIVE,
+                    //             REFRESH, CLEAN_UP. REFRESH is traffic/ETA on the road
+                    //             the driver is already on and was the value 282 could
+                    //             not have known to exclude.
+                    //   route id - NavigationRoute.getId(). If the primary route is the
+                    //             same object the queue was built for, nothing about it
+                    //             became wrong, whatever the reason says.
+                    //
+                    // REROUTE flushes. The pending announcement describes geometry the
+                    // driver has left, and this file already argues that case for turn
+                    // instructions: a stale instruction is a WRONG instruction, not a
+                    // late one. The new route's own announcement follows immediately, so
+                    // the owner's "must not go silent afterwards" still holds.
+                    //
+                    // ALTERNATIVE, REFRESH and CLEAN_UP never flush.
+                    val routesReason = result.reason
+                    val primaryRouteId = result.navigationRoutes.firstOrNull()?.id
+                    val reasonIsRouteChange =
+                            routesReason == RoutesExtra.ROUTES_UPDATE_REASON_NEW ||
+                                    routesReason == RoutesExtra.ROUTES_UPDATE_REASON_REROUTE
+                    val replacesAnEarlierRoute =
+                            lastPrimaryRouteId != null &&
+                                    primaryRouteId != null &&
+                                    primaryRouteId != lastPrimaryRouteId
+
+                    // Logged on EVERY emission, flushing or not. The reason distribution
+                    // was the measurement nobody had when 282 was written; without it
+                    // the next reader is guessing again.
+                    android.util.Log.i(
+                            "SyncForge",
+                            "[SAFEROUTE-288] routes emission reason=" + routesReason +
+                                    " primary=" + (primaryRouteId ?: "none") +
+                                    " previous=" + (lastPrimaryRouteId ?: "none") +
+                                    " reasonIsRouteChange=" + reasonIsRouteChange +
+                                    " replacesAnEarlierRoute=" + replacesAnEarlierRoute
+                    )
+
+                    if (reasonIsRouteChange && replacesAnEarlierRoute) {
+                        flushSpeechForRouteChange(routesReason)
+                    }
+
+                    if (primaryRouteId != null) {
+                        lastPrimaryRouteId = primaryRouteId
+                    }
 
                     // [SAFEROUTE-283] Registered ONCE, not per route change.
                     //
