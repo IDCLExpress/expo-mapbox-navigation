@@ -271,7 +271,50 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     private val MAX_PENDING_SPEECH = 10
 
     private var speechInFlight = false
+
+    /**
+     * [SAFEROUTE-282] Generation counter for speech belonging to the current route.
+     *
+     * A route change invalidates every announcement that was in flight or queued for
+     * the route being replaced. speechApi.cancel() stops synthesis but does NOT invoke
+     * speechCallback, so without this counter a cancelled job leaves speechInFlight
+     * true forever and every later announcement queues behind a job that can never
+     * complete - measured on device 2026-09-14: four stalls in 90s, each followed by
+     * total silence until the view was rebuilt.
+     *
+     * Incremented by flushSpeechForRouteChange(). A callback whose epoch no longer
+     * matches is discarded without playing and without touching queue state.
+     */
+    private var speechEpoch = 0
+    private var inFlightEpoch = -1
     private val pendingSpeech = ArrayDeque<com.mapbox.api.directions.v5.models.VoiceInstructions>()
+
+    /**
+     * [SAFEROUTE-282] Drops all speech belonging to the route being replaced and
+     * restores the queue to a usable state.
+     *
+     * Owner requirement: a route change MAY cut off speech in progress - the driver
+     * caused it by changing the route - but the app MUST NOT go silent afterwards.
+     * Anything queued for the old route is discarded rather than spoken late: a turn
+     * instruction for a discarded route is a WRONG instruction, not merely a stale
+     * one, and acting on it can put the driver in the wrong lane.
+     *
+     * Clearing speechInFlight here is the whole point. onSpeechFinished() is reached
+     * only from speechCallback, and a cancelled generate() never calls it.
+     */
+    private fun flushSpeechForRouteChange(reason: String) {
+        speechEpoch++
+        val dropped = pendingSpeech.size
+        pendingSpeech.clear()
+        speechApi.cancel()
+        voiceInstructionsPlayer.clear()
+        speechInFlight = false
+        android.util.Log.i(
+                "SyncForge",
+                "[SAFEROUTE-282] speech flushed (" + reason + "); dropped " + dropped +
+                        " queued, in-flight cleared, epoch=" + speechEpoch
+        )
+    }
 
     private fun enqueueSpeech(instruction: com.mapbox.api.directions.v5.models.VoiceInstructions) {
         // [SF-244 P2] The no-locking design rests on this being main-thread only. A
@@ -296,6 +339,8 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
             return
         }
         speechInFlight = true
+        // [SAFEROUTE-282] Stamp the route generation this synthesis belongs to.
+        inFlightEpoch = speechEpoch
         speechApi.generate(instruction, speechCallback)
     }
 
@@ -322,6 +367,18 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
 
     private val speechCallback =
             MapboxNavigationConsumer<Expected<SpeechError, SpeechValue>> { expected ->
+                // [SAFEROUTE-282] Synthesis that outlived its route. Do not play it and
+                // do not touch queue state: flushSpeechForRouteChange() already reset
+                // speechInFlight, and draining here would speak an announcement for a
+                // route the driver is no longer on.
+                if (inFlightEpoch != speechEpoch) {
+                    android.util.Log.i(
+                            "SyncForge",
+                            "[SAFEROUTE-282] discarded stale synthesis (epoch " +
+                                    inFlightEpoch + " != " + speechEpoch + ")"
+                    )
+                    return@MapboxNavigationConsumer
+                }
                 expected.fold(
                         { error ->
                             voiceInstructionsPlayer.play(
@@ -415,9 +472,12 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                         }
                     }
 
-                    // Clear speech
-                    speechApi.cancel()
-                    voiceInstructionsPlayer.clear()
+                    // [SAFEROUTE-282] Was: speechApi.cancel() + voiceInstructionsPlayer.clear().
+                    // Those two stopped synthesis and playback but left speechInFlight
+                    // true, because a cancelled generate() never reaches speechCallback.
+                    // Every later announcement then queued behind a job that could not
+                    // complete and the app went silent for the rest of the session.
+                    flushSpeechForRouteChange("route change")
 
                     // Add observer to navigation camera
                     navigationCamera.registerNavigationCameraStateChangeObserver {
