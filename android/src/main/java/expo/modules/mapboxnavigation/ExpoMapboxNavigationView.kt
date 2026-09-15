@@ -273,6 +273,12 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     private var speechInFlight = false
 
     /**
+     * [SAFEROUTE-283] Guards the navigation-camera state observer so it is registered
+     * once for the life of the view rather than once per route change.
+     */
+    private var cameraStateObserverRegistered = false
+
+    /**
      * [SAFEROUTE-282] Generation counter for speech belonging to the current route.
      *
      * A route change invalidates every announcement that was in flight or queued for
@@ -328,6 +334,25 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                     "SyncForge",
                     "[SF-244] enqueueSpeech called off the main thread - the queue is not thread-safe"
             )
+        }
+        // [SAFEROUTE-283] Muted means do not do the work, not do it inaudibly.
+        //
+        // volume(SpeechVolume(0f)) silences the player but the announcement is still
+        // synthesised, still occupies speechInFlight for its full duration, and still
+        // calls play() - which requests and abandons SYSTEM audio focus. Audio focus
+        // is unaffected by player volume, so a muted announcement still interrupts the
+        // driver's own music and the other in-app voice. Dropping here is the only
+        // point at which none of that work starts.
+        //
+        // Dropped rather than deferred: an announcement is about the road now. If the
+        // driver unmutes later, the correct content is whatever is true then, not a
+        // replay of what was true while muted.
+        if (isMuted) {
+            android.util.Log.i(
+                    "SyncForge",
+                    "[SAFEROUTE-283] muted; announcement dropped without synthesis"
+            )
+            return
         }
         if (speechInFlight) {
             if (pendingSpeech.size >= MAX_PENDING_SPEECH) {
@@ -479,8 +504,22 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                     // complete and the app went silent for the rest of the session.
                     flushSpeechForRouteChange("route change")
 
-                    // Add observer to navigation camera
-                    navigationCamera.registerNavigationCameraStateChangeObserver {
+                    // [SAFEROUTE-283] Registered ONCE, not per route change.
+                    //
+                    // This sat unguarded inside onRoutesChanged, so every route change
+                    // added another observer. Measured 2026-09-14: 6 route changes in
+                    // 90s. Each camera state transition then invokes every observer
+                    // registered so far, so per-event work grows with the number of
+                    // times the driver has pressed Navigate - fine at first, worse the
+                    // longer the session runs, which is the reported symptom.
+                    //
+                    // It is registered here rather than unregistered later because the
+                    // Mapbox API takes an anonymous lambda and exposes no matching
+                    // unregister for it: once registered it cannot be removed. Not
+                    // registering again is the only available fix.
+                    if (!cameraStateObserverRegistered) {
+                        cameraStateObserverRegistered = true
+                        navigationCamera.registerNavigationCameraStateChangeObserver {
                             navigationCameraState ->
                         // shows/hide the recenter button depending on the camera
                         // state
@@ -490,6 +529,7 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                             NavigationCameraState.TRANSITION_TO_OVERVIEW,
                             NavigationCameraState.OVERVIEW,
                             NavigationCameraState.IDLE -> recenterButton.visibility = View.VISIBLE
+                            }
                         }
                     }
 
