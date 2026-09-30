@@ -87,6 +87,8 @@ import com.mapbox.navigation.ui.maps.route.line.api.MapboxRouteLineApi
 import com.mapbox.navigation.ui.maps.route.line.api.MapboxRouteLineView
 import com.mapbox.navigation.ui.maps.route.line.model.*
 import com.mapbox.navigation.voice.api.*
+import android.media.AudioAttributes
+import com.mapbox.navigation.voice.options.VoiceInstructionsPlayerOptions
 import com.mapbox.navigation.voice.model.SpeechAnnouncement
 import com.mapbox.navigation.voice.model.SpeechError
 import com.mapbox.navigation.voice.model.SpeechValue
@@ -142,8 +144,42 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     private val mapboxNavigation = MapboxNavigationApp.current()
     private var mapboxStyle: Style? = null
     private val navigationLocationProvider = NavigationLocationProvider()
+    // [SYNCFORGE-317] Construct with explicit options instead of taking the SDK defaults.
+    //
+    // Measured from the artifact this module actually compiles against
+    // (voice-ndk27-3.11.0.aar, android/build.gradle:92), by reading the Builder's
+    // constructor bytecode rather than the documentation - the 3.12 docs page states the
+    // opposite of what the jar does, and that page was repeated as fact once already on
+    // this ticket:
+    //
+    //     focusGain    = 3   AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+    //     streamType   = 3   STREAM_MUSIC
+    //     ttsStreamType= 3   STREAM_MUSIC
+    //     usage        = 12  USAGE_ASSISTANCE_NAVIGATION_GUIDANCE   <- already correct
+    //     contentType  = 2   CONTENT_TYPE_MUSIC                     <- contradicts usage
+    //     useLegacyApi = unset in <init>, so false: the modern AudioFocusRequest path is
+    //                    live, which is what makes usage and contentType actually consulted
+    //
+    // So the app has been telling Android "this is navigation guidance" and "this is music"
+    // at the same time. CONTENT_TYPE_SPEECH removes the contradiction. usage is left alone
+    // because it was never wrong - an earlier theory on this ticket proposed "fixing" it and
+    // would have shipped a no-op.
+    //
+    // This is Part 1 of SYNCFORGE-317 and is NOT expected on its own to guarantee audibility
+    // during a phone call. Part 2 is the call case proper: ttsStreamType decides which stream
+    // the TTS engine plays on, STREAM_MUSIC is what telephony suppresses mid-call, and the
+    // right value is call-state dependent - STREAM_VOICE_CALL while no call is active would
+    // route guidance to the earpiece instead of the speaker. AudioFocusDelegate cannot help
+    // there: measured, it is only requestFocus()/abandonFocus() and has no say over the TTS
+    // stream. That needs its own design.
     private var voiceInstructionsPlayer =
-            MapboxVoiceInstructionsPlayer(context, currentLocale.toLanguageTag())
+            MapboxVoiceInstructionsPlayer(
+                    context,
+                    currentLocale.toLanguageTag(),
+                    VoiceInstructionsPlayerOptions.Builder()
+                            .contentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build(),
+            )
 
     private val parentConstraintLayout =
             ConstraintLayout(context).also {
