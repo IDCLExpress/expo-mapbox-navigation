@@ -275,6 +275,36 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
         return inCallVoicePlayer
     }
 
+    private companion object {
+        /**
+         * Output device types that render MEDIA audio, i.e. that a navigation
+         * announcement on STREAM_MUSIC can actually be heard through.
+         *
+         * [SYNCFORGE-317 P2] A set rather than an || chain so that adding a type is a
+         * one-line change and cannot be half-applied. The first revision listed only
+         * A2DP and the two 3.5mm wired types, which silently excluded USB-C headsets -
+         * on a phone with no headphone jack that is the ordinary wired case, and a rider
+         * on USB-C earbuds would have been pushed onto the call stream for no reason.
+         *
+         * These are compile-time int constants, so naming a type introduced after
+         * minSdk 24 is safe: the literal inlines and a device that does not know the
+         * type simply never reports it.
+         */
+        private val MEDIA_OUTPUT_TYPES =
+                setOf(
+                        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                        AudioDeviceInfo.TYPE_USB_HEADSET,
+                        AudioDeviceInfo.TYPE_USB_DEVICE,
+                        AudioDeviceInfo.TYPE_USB_ACCESSORY,
+                        AudioDeviceInfo.TYPE_HEARING_AID,
+                        AudioDeviceInfo.TYPE_BLE_HEADSET,
+                        AudioDeviceInfo.TYPE_BLE_SPEAKER,
+                        AudioDeviceInfo.TYPE_BLE_BROADCAST,
+                )
+    }
+
     /**
      * Whether an output that renders media audio is currently attached.
      *
@@ -291,9 +321,7 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     private fun hasMediaOutputPath(): Boolean {
         return try {
             audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
-                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                        it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-                        it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                it.type in MEDIA_OUTPUT_TYPES
             }
         } catch (t: Throwable) {
             android.util.Log.w(
