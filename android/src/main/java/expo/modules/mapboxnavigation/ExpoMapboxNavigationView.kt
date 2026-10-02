@@ -88,6 +88,8 @@ import com.mapbox.navigation.ui.maps.route.line.api.MapboxRouteLineView
 import com.mapbox.navigation.ui.maps.route.line.model.*
 import com.mapbox.navigation.voice.api.*
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import com.mapbox.navigation.voice.options.VoiceInstructionsPlayerOptions
 import com.mapbox.navigation.voice.model.SpeechAnnouncement
 import com.mapbox.navigation.voice.model.SpeechError
@@ -181,6 +183,128 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                             .build(),
             )
 
+    // [SYNCFORGE-317 P2] Second player, on the voice-call stream.
+    //
+    // Why two players and not one retuned in place: ttsStreamType and streamType are
+    // fixed at construction - verified with javap against voice-ndk27-3.11.0.aar, the
+    // Builder exposes ttsStreamType(int)/streamType(int) but the options object has no
+    // setter. Changing the stream therefore means a different instance.
+    //
+    // Why both instances live for the whole view: [SYNCFORGE-239] NEVER replace the
+    // voice player. Rebuilding it destroyed the component that was speaking - measured
+    // on device 2026-09-10 22:47 (build 1417099), focus taken at .825 and abandoned at
+    // .970, a 145ms window, too short to say a word. Two instances that are both
+    // constructed once and never destroyed satisfy that rule strictly more easily than
+    // one: nothing is ever torn down, so no focus can be stranded. selectVoicePlayer()
+    // only chooses between them; it never builds or shuts one down.
+    //
+    // Why this is needed at all: during a call the headset's link is owned by Bluetooth
+    // SCO, A2DP is suspended on the same device, and STREAM_MUSIC renders to the phone's
+    // own speaker - so the app speaks into a tank bag while the rider's ear is on SCO.
+    // Measured 2026-10-01 19:02:26-19:03:30: MODE_IN_CALL, 333 Bluetooth lines,
+    // calculateBaselineRoute -> AudioRoute[Type=TYPE_BLUETOOTH_SCO].
+    //
+    // usage is USAGE_VOICE_COMMUNICATION here rather than the default 12
+    // (ASSISTANCE_NAVIGATION_GUIDANCE) deliberately: this instance exists to ride the
+    // call path, and navigation-guidance usage is what telephony declines to duck for.
+    // streamType and ttsStreamType are both set because MapboxSpeechApi can return a
+    // synthesised file (played via the media path) or fall back to on-device TTS, and
+    // both have to land on the call stream.
+    private var inCallVoicePlayer =
+            MapboxVoiceInstructionsPlayer(
+                    context,
+                    currentLocale.toLanguageTag(),
+                    VoiceInstructionsPlayerOptions.Builder()
+                            .contentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .usage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            .streamType(AudioManager.STREAM_VOICE_CALL)
+                            .ttsStreamType(AudioManager.STREAM_VOICE_CALL)
+                            .build(),
+            )
+
+    private val audioManager =
+            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    /**
+     * Which player this announcement should speak through.
+     *
+     * [SYNCFORGE-317 P2] Read at play() time rather than at enqueue time. The approved
+     * design (P1 v4 5.2) had a cached call-state boolean updated by
+     * AudioManager.OnModeChangedListener on API 31+ with a getMode() fallback below it.
+     * This is a deliberate simplification of that: one getMode() read at the moment of
+     * output covers every API level from 24 up, removes the listener, removes the
+     * @Volatile cross-thread field, and closes the enqueue-to-play race the design had
+     * to accept. getMode() is a binder call made a few times a minute, which is nothing.
+     *
+     * Order matters and follows P1 v4 5.1. A surviving media path is preferred over the
+     * call stream, because multipoint intercoms (Sena, Cardo) keep A2DP alive during a
+     * call: those riders keep today's behaviour exactly, nothing is reconstructed, and
+     * the call's uplink is never touched. Only when no media path survives - the generic
+     * HFP case - does this fall through to the call stream.
+     *
+     * With no call active this always returns the media player. STREAM_VOICE_CALL with
+     * no call in progress routes guidance to the earpiece instead of the speaker, so
+     * guessing wrong in that direction is its own defect.
+     */
+    private fun selectVoicePlayer(): MapboxVoiceInstructionsPlayer {
+        val mode =
+                try {
+                    audioManager.mode
+                } catch (t: Throwable) {
+                    android.util.Log.w(
+                            "SyncForge",
+                            "[SYNCFORGE-317] getMode() failed; treating as no call",
+                            t
+                    )
+                    AudioManager.MODE_NORMAL
+                }
+        val callActive =
+                mode == AudioManager.MODE_IN_CALL ||
+                        mode == AudioManager.MODE_IN_COMMUNICATION
+        if (!callActive) {
+            return voiceInstructionsPlayer
+        }
+        if (hasMediaOutputPath()) {
+            return voiceInstructionsPlayer
+        }
+        android.util.Log.i(
+                "SyncForge",
+                "[SYNCFORGE-317] call active (mode=" + mode +
+                        ") and no media output path; speaking on the call stream"
+        )
+        return inCallVoicePlayer
+    }
+
+    /**
+     * Whether an output that renders media audio is currently attached.
+     *
+     * [SYNCFORGE-317 P2] Device TYPE only, never device name. BLUETOOTH_CONNECT is not
+     * held by this app - measured from the merged manifest of the shipped
+     * SafeRoute-1445773.apk, which declares 16 permissions and not that one - and it is
+     * a runtime permission on API 31+, so reading names would put a permission prompt in
+     * front of riders. Types need no permission.
+     *
+     * Failure and ambiguity both return false, which sends an in-call announcement to the
+     * call stream. That is the branch that works in the hard case, and the owner's ruling
+     * is that rider audibility wins.
+     */
+    private fun hasMediaOutputPath(): Boolean {
+        return try {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                        it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w(
+                    "SyncForge",
+                    "[SYNCFORGE-317] getDevices() failed; assuming no media path",
+                    t
+            )
+            false
+        }
+    }
+
     private val parentConstraintLayout =
             ConstraintLayout(context).also {
                 addView(it, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
@@ -217,7 +341,12 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     private val soundButtonId = 4
     private val soundButton =
             createSoundButton(soundButtonId, parentConstraintLayout) {
+                // [SYNCFORGE-317 P2] Both players. Mute is per-instance volume state,
+                // so a site that sets only one leaves the other audible.
+                // Polarity is correct: this runs BEFORE `isMuted = !isMuted` below, so
+                // isMuted is still the pre-toggle value here. Do not "fix" it.
                 voiceInstructionsPlayer.volume(SpeechVolume(if (isMuted) 1.0f else 0.0f))
+                inCallVoicePlayer.volume(SpeechVolume(if (isMuted) 1.0f else 0.0f))
                 it.findViewById<ImageView>(com.mapbox.navigation.ui.components.R.id.buttonIcon)
                         .setImageResource(
                                 if (isMuted) R.drawable.icon_sound else R.drawable.icon_mute
@@ -365,7 +494,12 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
         val dropped = pendingSpeech.size
         pendingSpeech.clear()
         speechApi.cancel()
+        // [SYNCFORGE-317 P2] Both players, unconditionally. An announcement queued on
+        // whichever instance is not currently selected is exactly as stale as one on the
+        // selected instance, and a conditional clear would let it speak after the
+        // reroute - the defect [SAFEROUTE-282] exists to prevent.
         voiceInstructionsPlayer.clear()
+        inCallVoicePlayer.clear()
         speechInFlight = false
         android.util.Log.i(
                 "SyncForge",
@@ -456,19 +590,13 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                     )
                     return@MapboxNavigationConsumer
                 }
+                // [SYNCFORGE-317 P2] Resolved once here, not per branch, so the
+                // error fallback and the synthesised announcement cannot land on
+                // different streams within one announcement.
+                val player = selectVoicePlayer()
                 expected.fold(
-                        { error ->
-                            voiceInstructionsPlayer.play(
-                                    error.fallback,
-                                    voiceInstructionsPlayerCallback
-                            )
-                        },
-                        { value ->
-                            voiceInstructionsPlayer.play(
-                                    value.announcement,
-                                    voiceInstructionsPlayerCallback
-                            )
-                        }
+                        { error -> player.play(error.fallback, voiceInstructionsPlayerCallback) },
+                        { value -> player.play(value.announcement, voiceInstructionsPlayerCallback) }
                 )
                 // [SF-244] Synthesis is complete either way - the error branch plays a
                 // fallback, so both are completions. Released here rather than inside a
@@ -1093,7 +1221,9 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
             mapboxNavigation?.stopTripSession()
         }
         speechApi.cancel()
+        // [SYNCFORGE-317 P2] Both, or the second instance leaks its TTS engine binding.
         voiceInstructionsPlayer.shutdown()
+        inCallVoicePlayer.shutdown()
         mapView.location.removeOnIndicatorPositionChangedListener(
                 onIndicatorPositionChangedListener
         )
@@ -1242,7 +1372,9 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     fun setIsMuted(isMutedProp: Boolean?) {
         if (isMutedProp != null) {
             isMuted = isMutedProp
+            // [SYNCFORGE-317 P2] Both players - see the sound button site.
             voiceInstructionsPlayer.volume(SpeechVolume(if (isMuted) 0.0f else 1.0f))
+            inCallVoicePlayer.volume(SpeechVolume(if (isMuted) 0.0f else 1.0f))
             soundButton
                     .findViewById<ImageView>(com.mapbox.navigation.ui.components.R.id.buttonIcon)
                     .setImageResource(if (isMuted) R.drawable.icon_mute else R.drawable.icon_sound)
@@ -1371,6 +1503,7 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
         // in the player's queue.
         if (lastAppliedLocale != currentLocale) {
             voiceInstructionsPlayer.updateLanguage(currentLocale.toLanguageTag())
+            inCallVoicePlayer.updateLanguage(currentLocale.toLanguageTag())
             speechApi = MapboxSpeechApi(context, currentLocale.toLanguageTag())
             lastAppliedLocale = currentLocale
             android.util.Log.i(
@@ -1379,7 +1512,9 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
             )
         }
         // Volume is cheap and reflects the mute prop, so it is applied every time.
+        // [SYNCFORGE-317 P2] Both players.
         voiceInstructionsPlayer.volume(SpeechVolume(if (isMuted) 0.0f else 1.0f))
+        inCallVoicePlayer.volume(SpeechVolume(if (isMuted) 0.0f else 1.0f))
 
         if (currentMapStyle != null) {
             mapboxMap.loadStyle(currentMapStyle!!) { style: Style ->
