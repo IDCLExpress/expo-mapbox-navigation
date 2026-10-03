@@ -88,7 +88,6 @@ import com.mapbox.navigation.ui.maps.route.line.api.MapboxRouteLineView
 import com.mapbox.navigation.ui.maps.route.line.model.*
 import com.mapbox.navigation.voice.api.*
 import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import com.mapbox.navigation.voice.options.VoiceInstructionsPlayerOptions
 import com.mapbox.navigation.voice.model.SpeechAnnouncement
@@ -210,6 +209,88 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
     // streamType and ttsStreamType are both set because MapboxSpeechApi can return a
     // synthesised file (played via the media path) or fall back to on-device TTS, and
     // both have to land on the call stream.
+    private val audioManager =
+            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    /**
+     * No-op. The delegate below does not act on focus changes by design - see its
+     * comment. A listener is required by the pre-API-26 focus API, nothing more.
+     */
+    private val inCallFocusListener = AudioManager.OnAudioFocusChangeListener {}
+
+    /**
+     * [SYNCFORGE-317 P3] Speak during a call without depending on the focus grant.
+     *
+     * Measured on device 2026-10-02, build 1448428 (Part 2), during a live call with
+     * navigation running and nothing audible:
+     *
+     *   I MediaFocusControl: requestAudioFocus() from uid/pid 10669/16994
+     *       AA=USAGE_ASSISTANCE_NAVIGATION_GUIDANCE/CONTENT_TYPE_SPEECH
+     *       callingPack=com.idclexpress.saferoute req=3 flags=0x0 sdk=36
+     *   D MediaFocusControl: requestAudioFocus failed while call
+     *
+     * repeated every time an announcement was due. One UI refuses app audio focus for
+     * the duration of a call. The refusal names the call state, not the gain: req=3 is
+     * AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK, and raising it would not have helped. That is
+     * why Part 1 (contentType) and Part 2 (stream selection) both had no effect - both
+     * are downstream of a focus request that is denied before any audio is produced.
+     *
+     * Android audio focus is cooperative, not enforced at the mixer. The refusal stops
+     * MapboxVoiceInstructionsPlayer from trying, not the hardware from playing. So this
+     * delegate reports success and lets the player proceed.
+     *
+     * It still attempts the real request and ignores the result. On hardware that WOULD
+     * grant focus mid-call the system is properly informed, so ducking and bookkeeping
+     * behave; on One UI the attempt is refused and playback goes ahead regardless.
+     *
+     * Scope is deliberately one instance. This delegate is attached ONLY to
+     * inCallVoicePlayer, and selectVoicePlayer() returns that instance only while a call
+     * is active. With no call in progress, focus behaviour is exactly as before, so
+     * SafeRoute cannot talk over the rider's music, a podcast, or another navigation
+     * app. The bypass reaches the case the owner asked for and nothing else.
+     *
+     * Owner ruling 2026-10-01, on being told the remote party may hear instructions:
+     * "Speak anyway." A rider missing a turn at speed is the hazard.
+     */
+    private val inCallFocusDelegate =
+            object : AudioFocusDelegate {
+                override fun requestFocus(): Boolean {
+                    try {
+                        @Suppress("DEPRECATION")
+                        audioManager.requestAudioFocus(
+                                inCallFocusListener,
+                                AudioManager.STREAM_VOICE_CALL,
+                                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK,
+                        )
+                    } catch (t: Throwable) {
+                        android.util.Log.w(
+                                "SyncForge",
+                                "[SYNCFORGE-317] focus request threw; proceeding anyway",
+                                t
+                        )
+                    }
+                    android.util.Log.i(
+                            "SyncForge",
+                            "[SYNCFORGE-317] in-call focus delegate reporting granted"
+                    )
+                    return true
+                }
+
+                override fun abandonFocus(): Boolean {
+                    try {
+                        @Suppress("DEPRECATION")
+                        audioManager.abandonAudioFocus(inCallFocusListener)
+                    } catch (t: Throwable) {
+                        android.util.Log.w(
+                                "SyncForge",
+                                "[SYNCFORGE-317] focus abandon threw",
+                                t
+                        )
+                    }
+                    return true
+                }
+            }
+
     private var inCallVoicePlayer =
             MapboxVoiceInstructionsPlayer(
                     context,
@@ -220,10 +301,8 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
                             .streamType(AudioManager.STREAM_VOICE_CALL)
                             .ttsStreamType(AudioManager.STREAM_VOICE_CALL)
                             .build(),
+                    inCallFocusDelegate,
             )
-
-    private val audioManager =
-            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     /**
      * Which player this announcement should speak through.
@@ -236,11 +315,18 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
      * @Volatile cross-thread field, and closes the enqueue-to-play race the design had
      * to accept. getMode() is a binder call made a few times a minute, which is nothing.
      *
-     * Order matters and follows P1 v4 5.1. A surviving media path is preferred over the
-     * call stream, because multipoint intercoms (Sena, Cardo) keep A2DP alive during a
-     * call: those riders keep today's behaviour exactly, nothing is reconstructed, and
-     * the call's uplink is never touched. Only when no media path survives - the generic
-     * HFP case - does this fall through to the call stream.
+     * [SYNCFORGE-317 P3] While a call is active this now ALWAYS returns the in-call
+     * player. Part 2 preferred a "surviving media path" first, and the device log
+     * disproved that preference: on 2026-10-02 at 20:17, with a live call and nothing
+     * audible, A2DP was reported present - the focus-stack line reads "device = 80",
+     * which is DEVICE_OUT_BLUETOOTH_A2DP - so the media player was selected and the
+     * in-call branch never ran. Its log line appears 0 times in 195,102 lines, and the
+     * refused focus request carries USAGE_ASSISTANCE_NAVIGATION_GUIDANCE, which is the
+     * media player's configuration.
+     *
+     * A2DP being attached during a call does not mean navigation on STREAM_MUSIC is
+     * heard through it. That was P1 v4 reviewer question 1 and the measurement answers
+     * it against the preference, so the preference is gone rather than tuned.
      *
      * With no call active this always returns the media player. STREAM_VOICE_CALL with
      * no call in progress routes guidance to the earpiece instead of the speaker, so
@@ -264,73 +350,12 @@ class ExpoMapboxNavigationView(context: Context, appContext: AppContext) :
         if (!callActive) {
             return voiceInstructionsPlayer
         }
-        if (hasMediaOutputPath()) {
-            return voiceInstructionsPlayer
-        }
         android.util.Log.i(
                 "SyncForge",
                 "[SYNCFORGE-317] call active (mode=" + mode +
-                        ") and no media output path; speaking on the call stream"
+                        "); speaking on the call stream with focus bypassed"
         )
         return inCallVoicePlayer
-    }
-
-    private companion object {
-        /**
-         * Output device types that render MEDIA audio, i.e. that a navigation
-         * announcement on STREAM_MUSIC can actually be heard through.
-         *
-         * [SYNCFORGE-317 P2] A set rather than an || chain so that adding a type is a
-         * one-line change and cannot be half-applied. The first revision listed only
-         * A2DP and the two 3.5mm wired types, which silently excluded USB-C headsets -
-         * on a phone with no headphone jack that is the ordinary wired case, and a rider
-         * on USB-C earbuds would have been pushed onto the call stream for no reason.
-         *
-         * These are compile-time int constants, so naming a type introduced after
-         * minSdk 24 is safe: the literal inlines and a device that does not know the
-         * type simply never reports it.
-         */
-        private val MEDIA_OUTPUT_TYPES =
-                setOf(
-                        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-                        AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-                        AudioDeviceInfo.TYPE_USB_HEADSET,
-                        AudioDeviceInfo.TYPE_USB_DEVICE,
-                        AudioDeviceInfo.TYPE_USB_ACCESSORY,
-                        AudioDeviceInfo.TYPE_HEARING_AID,
-                        AudioDeviceInfo.TYPE_BLE_HEADSET,
-                        AudioDeviceInfo.TYPE_BLE_SPEAKER,
-                        AudioDeviceInfo.TYPE_BLE_BROADCAST,
-                )
-    }
-
-    /**
-     * Whether an output that renders media audio is currently attached.
-     *
-     * [SYNCFORGE-317 P2] Device TYPE only, never device name. BLUETOOTH_CONNECT is not
-     * held by this app - measured from the merged manifest of the shipped
-     * SafeRoute-1445773.apk, which declares 16 permissions and not that one - and it is
-     * a runtime permission on API 31+, so reading names would put a permission prompt in
-     * front of riders. Types need no permission.
-     *
-     * Failure and ambiguity both return false, which sends an in-call announcement to the
-     * call stream. That is the branch that works in the hard case, and the owner's ruling
-     * is that rider audibility wins.
-     */
-    private fun hasMediaOutputPath(): Boolean {
-        return try {
-            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
-                it.type in MEDIA_OUTPUT_TYPES
-            }
-        } catch (t: Throwable) {
-            android.util.Log.w(
-                    "SyncForge",
-                    "[SYNCFORGE-317] getDevices() failed; assuming no media path",
-                    t
-            )
-            false
-        }
     }
 
     private val parentConstraintLayout =
