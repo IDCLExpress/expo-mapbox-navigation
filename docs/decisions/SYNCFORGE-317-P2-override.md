@@ -98,3 +98,106 @@ than dropped.
    `MEDIA_OUTPUT_TYPES`, `companion` or `USB_HEADSET`,** all present at the
    reviewed commit `86ccfa9`. Possibly a stale blob from the Contents API, possibly
    just unmentioned. Flagged, not concluded.
+
+---
+
+# Part 3 — override of task `3b938a56` (primary REJECTED, second UNKNOWN)
+
+Protocol 2 on `bb1109c`. Primary REJECTED; second returned 10,391 characters of
+substantive text but no parseable verdict token (UNKNOWN). Both read the new code.
+Decision: **overridden**, with one finding accepted as real and promoted to its own
+ticket.
+
+## A + B — mute polarity. OVERRIDDEN as incorrect. Fifth demand.
+
+Both critics agree with each other this time, and both are wrong. The second
+critic states:
+
+> If `isMuted` is `false` (sound is currently ON), the volume is set to `0.0f`
+> (mute), `isMuted` becomes `true`, and the icon is set to
+> `R.drawable.icon_sound` (sound ON). This is incorrect.
+
+That is a mis-evaluation of the conditional. The expression is
+`if (isMuted) R.drawable.icon_sound else R.drawable.icon_mute`. With
+`isMuted == false` it takes the **else** branch, which is `icon_mute` — not
+`icon_sound` as claimed. The stated reasoning inverts the branch it is reasoning
+about.
+
+The icon convention is settled by `createSoundButton` itself, line 1029:
+
+```kotlin
+.setImageResource(R.drawable.icon_sound)
+```
+
+That is the button's initial icon, set at construction, when `isMuted` is `false`.
+So `icon_sound` is what shows **while unmuted**: the icon displays the current
+state, not the pending action. Walking both paths against that convention:
+
+| before click | volume set | icon set | after |
+|---|---|---|---|
+| `isMuted=false` (unmuted, `icon_sound`) | `0.0f` muted | `icon_mute` | muted, muted icon |
+| `isMuted=true` (muted, `icon_mute`) | `1.0f` audible | `icon_sound` | unmuted, sound icon |
+
+And `setIsMuted` at line 1433, evaluated **after** assignment:
+`if (isMuted) icon_mute else icon_sound` → muted shows `icon_mute`. **Identical
+semantics.** Finding B's claim of prop/button inconsistency does not survive:
+both paths end on the same icon for the same state. A toggle handler reading
+pre-toggle state and a setter reading post-assignment state necessarily spell the
+same meaning opposite ways.
+
+Owner has ruled against this flip three times; the pipeline has now demanded it
+five. **Flipping it breaks mute.** Not changed.
+
+## C — deprecated focus API without version gating. NOT a defect.
+
+Deliberate. `minSdk` is 24 and `AudioFocusRequest` is API 26+, so the deprecated
+three-argument form is the one call that behaves identically across the whole
+supported range. The delegate discards the result by design (§3.2 of the Part 3
+design), so the richer API buys nothing here. Gating would add two code paths to
+reach the same ignored outcome.
+
+## D — `maneuverApi` / `tripProgressApi` rebuilt on every `update()`. REAL. ACCEPTED.
+
+This one is correct and the pipeline earned it. Measured:
+
+```
+1560:            speechApi = MapboxSpeechApi(...)        <- INSIDE if (lastAppliedLocale != currentLocale)
+1587:        maneuverApi = MapboxManeuverApi(...)        <- UNGUARDED
+1595:        tripProgressApi = MapboxTripProgressApi(...) <- UNGUARDED
+```
+
+The second critic's premise is wrong for `speechApi` — it sits inside the locale
+guard and is not rebuilt per update. But `maneuverApi` and `tripProgressApi` are
+reassigned **unconditionally on every `update()`**, and twelve prop setters call
+`update()`.
+
+This is the same pattern SYNCFORGE-239 removed for the voice player — rebuilding a
+live component whenever any prop changes — left in place for two neighbours.
+Whether it leaks depends on whether those two hold cancellable resources;
+`maneuverApi.cancel()` exists, which suggests they might.
+
+**Not fixed here.** It is pre-existing, untouched by Parts 1–3, and outside this
+ticket's range; folding an unrelated lifecycle change into an audio fix is how a
+diff becomes unreviewable. Raised as its own ticket with this evidence.
+
+## E, F, G — pre-existing, already tabled
+
+Force-unwraps (E) and main-thread-by-contract (F) are in the Part 2 table above.
+G (sound-button icon state if `setIsMuted` lands before inflation) is new but sits
+in the mute area the owner has placed off limits, so it goes to the owner with the
+restructure question rather than being changed here.
+
+## Pipeline observation
+
+The mute finding has now cost five review cycles across Parts 2 and 3, every one a
+false positive, because the line is read in isolation from the toggle three lines
+below it. The code comment has not stopped it. The durable fix is to restructure
+the handler so `isMuted` is assigned before volume and icon are applied, making
+all three sites read identically — behaviour-preserving in principle, but it is
+mute, it is on the owner's do-not-touch list, and it needs the owner's decision
+and its own device test. Recorded as the standing cost of not doing it.
+
+Second observation: `second_verdict` came back UNKNOWN on both `91a7d510` and
+`3b938a56` — both times the primary REJECTED this same file. The second critic
+produced full text on both occasions, so the verdict token is being lost rather
+than the critique failing. Worth a look at `_extract_second_verdict`.
