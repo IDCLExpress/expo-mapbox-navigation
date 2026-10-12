@@ -4,6 +4,7 @@ import MapboxMaps
 import MapboxNavigationUIKit
 import MapboxDirections
 import Combine
+import AVFoundation
 
 
 class ExpoMapboxNavigationView: ExpoView {
@@ -41,6 +42,150 @@ class ExpoMapboxNavigationView: ExpoView {
 
 class ExpoMapboxNavigationViewController: UIViewController {
     static let navigationProvider: MapboxNavigationProvider = MapboxNavigationProvider(coreConfig: CoreConfig(routingConfig: RoutingConfig(fasterRouteDetectionConfig: Optional<FasterRouteDetectionConfig>.none),locationSource: .live ))
+    // ── [SYNCFORGE-318] Navigation voice during a phone call ─────────────────
+    //
+    // Owner ruling 2026-10-12: build the most likely fix now and test it rather
+    // than measure first, with the understanding that it may be wrong and is
+    // revertible. This overrides step 1 of the approved design, which required
+    // reproducing the defect on a device before writing code. Recorded as an
+    // override, not as a measurement.
+    //
+    // WHAT CARRIES OVER FROM THE ANDROID FIX, AND WHAT CANNOT
+    //
+    // The Android fix (SYNCFORGE-317) injected an AudioFocusDelegate that
+    // reports focus granted, because One UI blanket-refuses app audio focus for
+    // the duration of a call. iOS HAS NO AUDIO FOCUS, so there is nothing to
+    // bypass and that mechanism cannot be ported. Two things do carry:
+    //
+    //  1. THE MEASUREMENT. On Android the decisive finding was that during a
+    //     call the headset is owned by the call profile (Bluetooth SCO), and
+    //     audio sent to the media path is reported as routed but is not heard.
+    //     The iOS equivalent of that profile is bluetoothHFP, and reaching it
+    //     requires the .playAndRecord category plus .allowBluetooth. That is
+    //     why this uses configuration B from the design rather than A: A
+    //     (.playback) is less invasive but routes to the media profile, which
+    //     is precisely what Android proved is inaudible mid-call.
+    //
+    //  2. SCOPE CONTAINMENT, which matters more. The Android fix attached its
+    //     bypass to ONE player selected only while a call was active, leaving
+    //     no-call behaviour byte-identical. iOS navigation voice WORKS today, so
+    //     the same discipline applies here: with no call active this touches
+    //     nothing at all. If it regresses ordinary navigation to fix the call
+    //     case, that is a net loss even if the call case improves.
+    //
+    // CALL DETECTION - and the obvious signal is a trap.
+    //
+    // AVAudioSession.isOtherAudioPlaying is true for MUSIC as well as calls, so
+    // using it would switch the microphone on via .playAndRecord whenever the
+    // rider is playing anything. Instead this reads the current ROUTE: a
+    // bluetoothHFP or builtInReceiver output means call-type audio owns the
+    // path, because media never routes to the receiver and HFP is the call
+    // profile. That is specific to the case we want and encodes the Android
+    // finding directly.
+    //
+    // UNVERIFIED, plainly: nothing here has been measured on an iPhone. The log
+    // lines exist so ONE device run either confirms this or names what is
+    // actually happening. If it fails, set inCallAudioEnabled to false for an
+    // exact revert to stock behaviour, and the captured log tells us whether to
+    // move to configuration A.
+
+    /// [SYNCFORGE-318] Single kill switch. false restores stock behaviour exactly.
+    static let inCallAudioEnabled = true
+
+    private static var inCallAudioStarted = false
+    /// Tracks whether WE took the session over, so it is only ever handed back
+    /// if we were the ones holding it.
+    private static var weConfiguredSession = false
+
+    /// Registers once for the app's lifetime. No removal: the observers are
+    /// tied to a static and must outlive any individual view controller, since
+    /// a call can start while navigation is already running.
+    @MainActor
+    static func startInCallAudioManagement() {
+        guard inCallAudioEnabled, !inCallAudioStarted else { return }
+        inCallAudioStarted = true
+
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in applyInCallAudioIfNeeded(reason: "routeChange") }
+        }
+
+        // With .mixWithOthers we may not be interrupted at all, but if we are,
+        // failing to reactivate would leave guidance silent for the rest of the
+        // drive even after the call ends - worse than the defect being fixed.
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil, queue: .main
+        ) { note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            if raw == AVAudioSession.InterruptionType.ended.rawValue {
+                Task { @MainActor in applyInCallAudioIfNeeded(reason: "interruptionEnded") }
+            }
+        }
+
+        applyInCallAudioIfNeeded(reason: "start")
+    }
+
+    /// A call-type output owns the route. See the note above on why
+    /// isOtherAudioPlaying is NOT used.
+    private static func callLikelyActive(_ session: AVAudioSession) -> Bool {
+        for output in session.currentRoute.outputs {
+            if output.portType == .bluetoothHFP || output.portType == .builtInReceiver {
+                return true
+            }
+        }
+        return false
+    }
+
+    @MainActor
+    static func applyInCallAudioIfNeeded(reason: String) {
+        guard inCallAudioEnabled else { return }
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let active = callLikelyActive(session)
+
+        // Logged unconditionally: one device run must be enough to confirm this
+        // or to say what is really happening, which is what Android took three
+        // builds to establish.
+        NSLog("[SYNCFORGE-318] %@: outputs=[%@] callLikely=%@ category=%@ mode=%@",
+              reason, outputs, active ? "YES" : "no",
+              session.category.rawValue, session.mode.rawValue)
+
+        let synthesizer = navigationProvider.routeVoiceController.speechSynthesizer
+
+        if active {
+            // Take the session over. While the SDK manages it, it chooses a
+            // category and activates on its own terms, and the app cannot add
+            // the option that decides whether audio coexists with a call.
+            synthesizer.managesAudioSession = false
+            do {
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .voicePrompt,
+                    options: [.mixWithOthers, .duckOthers, .allowBluetooth]
+                )
+                try session.setActive(true, options: [])
+                weConfiguredSession = true
+                NSLog("[SYNCFORGE-318] in-call audio configured (playAndRecord/voicePrompt/mix+duck+allowBluetooth)")
+            } catch {
+                // Hand the session back rather than leaving it orphaned with
+                // nobody managing it - that would be worse than not trying.
+                synthesizer.managesAudioSession = true
+                weConfiguredSession = false
+                NSLog("[SYNCFORGE-318] configure FAILED: %@ - handed session back to the SDK",
+                      error.localizedDescription)
+            }
+        } else if weConfiguredSession {
+            synthesizer.managesAudioSession = true
+            weConfiguredSession = false
+            NSLog("[SYNCFORGE-318] call-type route gone; session handed back to the SDK")
+        }
+        // No call and we never configured anything: deliberately does nothing.
+        // This is the scope containment described above.
+    }
+
     var mapboxNavigation: MapboxNavigation? = nil
     var routingProvider: RoutingProvider? = nil
     var navigation: NavigationController? = nil
@@ -84,6 +229,13 @@ class ExpoMapboxNavigationViewController: UIViewController {
         routingProvider = mapboxNavigation!.routingProvider()
         navigation = mapboxNavigation!.navigation()
         tripSession = mapboxNavigation!.tripSession()
+
+        // [SYNCFORGE-318] Registers once; evaluates the route immediately so a
+        // call already in progress when navigation starts is handled. The owner
+        // established on Android that launch order must not matter: "whether I
+        // make the call first or make the call after I start the app, it
+        // shouldn't matter. The app should always give me directions."
+        ExpoMapboxNavigationViewController.startInCallAudioManagement()
 
         routeProgressCancellable = navigation!.routeProgress.sink { progressState in
             if(progressState != nil){
